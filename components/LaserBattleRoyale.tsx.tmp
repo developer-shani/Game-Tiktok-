@@ -1,0 +1,1248 @@
+'use client';
+
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import {
+  Play,
+  Pause,
+  RotateCcw,
+  Volume2,
+  VolumeX,
+  Settings,
+  X,
+  Trophy,
+  Swords,
+  Sparkles,
+  Flame,
+  Zap,
+  Maximize2,
+  Minimize2,
+  StepForward,
+  Settings,
+} from 'lucide-react';
+import confetti from 'canvas-confetti';
+import { Ball, Particle, Shockwave, KillEvent, SimulationConfig, WinnerStats } from '@/lib/types';
+import {
+  BALL_PRESETS,
+  computeRayAnchors,
+  initializeBalls,
+  stepSimulation,
+  createEliminationParticles,
+  createBounceSparks,
+} from '@/lib/physics';
+import { soundEngine } from '@/lib/audio';
+
+const DEFAULT_CONFIG: SimulationConfig = {
+  headerText: "DAY 7 UNTIL PINK WINS",
+  speed: 300,
+  bounciness: 1.0,
+  gravity: 0,
+  ballRadius: 15,
+  competitors: 4,
+  players: [
+    { name: "Player 1", color: "#FF1493" },
+    { name: "Player 2", color: "#00E676" },
+    { name: "Player 3", color: "#00E5FF" },
+    { name: "Player 4", color: "#FF9100" },
+    { name: "Player 5", color: "#D500F9" },
+    { name: "Player 6", color: "#FFD600" },
+    { name: "Player 7", color: "#FF1744" },
+    { name: "Player 8", color: "#00F5D4" },
+  ],
+  rayCount: 40,
+  arcSpanDeg: 60,
+  glowIntensity: 1.0,
+  soundEnabled: true,
+  autoRestart: true,
+  autoRestartDelaySec: 3,
+  speedMultiplier: 1.0,
+};
+
+export default function LaserBattleRoyale() {
+  // Canvas refs
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  // Simulation State Refs (for smooth 60fps mutable physics loop)
+  const ballsRef = useRef<Ball[]>([]);
+  const particlesRef = useRef<Particle[]>([]);
+  const shockwavesRef = useRef<Shockwave[]>([]);
+  const isRunningRef = useRef<boolean>(true);
+  const configRef = useRef<SimulationConfig>(DEFAULT_CONFIG);
+  const animationFrameRef = useRef<number | null>(null);
+  const arenaCenterRef = useRef<{ x: number; y: number }>({ x: 300, y: 300 });
+  const arenaRadiusRef = useRef<number>(240);
+  const selectedBallPredictionRef = useRef<string | null>(null);
+  const roundStartTimeRef = useRef<number>(0);
+  const isRoundOverRef = useRef<boolean>(false);
+  const autoRestartTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const restartCountdownRef = useRef<number>(0);
+
+  // React UI States
+  const [config, setConfig] = useState<SimulationConfig>(DEFAULT_CONFIG);
+  const [isPlaying, setIsPlaying] = useState<boolean>(true);
+  const [isRoundOver, setIsRoundOver] = useState<boolean>(false);
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+  const [roundNumber, setRoundNumber] = useState<number>(1);
+  const [killFeed, setKillFeed] = useState<KillEvent[]>([]);
+  const [activeBalls, setActiveBalls] = useState<Ball[]>(() => {
+    const initial = initializeBalls(DEFAULT_CONFIG.ballCount, { x: 300, y: 300 }, 240, DEFAULT_CONFIG);
+    return initial;
+  });
+  const [winner, setWinner] = useState<Ball | null>(null);
+  const [restartCountdown, setRestartCountdown] = useState<number>(0);
+  const [stats, setStats] = useState<WinnerStats[]>(() =>
+    BALL_PRESETS.map((p) => ({ color: p.color, name: p.name, wins: 0 }))
+  );
+  const [predictedColor, setPredictedColor] = useState<string | null>(null);
+  const [predictionStreak, setPredictionStreak] = useState<number>(0);
+  const [predictionAccuracy, setPredictionAccuracy] = useState<{ wins: number; total: number }>({
+    wins: 0,
+    total: 0,
+  });
+  const [showSettings, setShowSettings] = useState<boolean>(false);
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+
+  // Initialize ballsRef once on mount
+  useEffect(() => {
+    ballsRef.current = initializeBalls(
+      configRef.current.ballCount,
+      arenaCenterRef.current,
+      arenaRadiusRef.current,
+      configRef.current
+    );
+    roundStartTimeRef.current = Date.now();
+  }, []);
+
+  // Sync config ref
+  useEffect(() => {
+    configRef.current = config;
+    soundEngine.setEnabled(config.soundEnabled);
+  }, [config]);
+
+  // Keep selected prediction ref in sync
+  useEffect(() => {
+    selectedBallPredictionRef.current = predictedColor;
+  }, [predictedColor]);
+
+  // Trigger celebration confetti
+  const triggerCelebration = useCallback((winnerColor: string) => {
+    confetti({
+      particleCount: 80,
+      spread: 70,
+      origin: { y: 0.6 },
+      colors: [winnerColor, '#ffffff', '#ffd700'],
+      zIndex: 1000,
+    });
+  }, []);
+
+  // Reset / Start a New Round
+  const startNewRound = useCallback(
+    (customCount?: number) => {
+      if (autoRestartTimerRef.current) {
+        clearInterval(autoRestartTimerRef.current);
+        autoRestartTimerRef.current = null;
+      }
+
+      isRoundOverRef.current = false;
+      setIsRoundOver(false);
+      setWinner(null);
+      setRestartCountdown(0);
+      restartCountdownRef.current = 0;
+      roundStartTimeRef.current = Date.now();
+
+      const count = customCount ?? configRef.current.ballCount;
+      const balls = initializeBalls(
+        count,
+        arenaCenterRef.current,
+        arenaRadiusRef.current,
+        configRef.current
+      );
+
+      ballsRef.current = balls;
+      particlesRef.current = [];
+      shockwavesRef.current = [];
+      setActiveBalls([...balls]);
+      setKillFeed([]);
+
+      soundEngine.playClick();
+    },
+    []
+  );
+
+  // Resize canvas according to container
+  const updateCanvasDimensions = useCallback(() => {
+    const canvas = canvasRef.current;
+    const container = containerRef.current;
+    if (!canvas || !container) return;
+
+    const rect = container.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+
+    // Arena sizing (responsive square/circle viewport)
+    const size = Math.min(rect.width, rect.height > 0 ? rect.height : 600);
+    const canvasWidth = size;
+    const canvasHeight = size;
+
+    canvas.width = canvasWidth * dpr;
+    canvas.height = canvasHeight * dpr;
+    canvas.style.width = `${canvasWidth}px`;
+    canvas.style.height = `${canvasHeight}px`;
+
+    const cx = canvasWidth / 2;
+    const cy = canvasHeight / 2;
+    // Arena radius fits comfortably with margin for neon glow and HUD
+    const radius = Math.max(120, canvasWidth * 0.44);
+
+    arenaCenterRef.current = { x: cx, y: cy };
+    arenaRadiusRef.current = radius;
+  }, []);
+
+  // Initialize Canvas & Resize Listener
+  useEffect(() => {
+    updateCanvasDimensions();
+
+    const handleResize = () => {
+      updateCanvasDimensions();
+    };
+
+    window.addEventListener('resize', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+      if (autoRestartTimerRef.current) {
+        clearInterval(autoRestartTimerRef.current);
+      }
+    };
+  }, [updateCanvasDimensions]);
+
+  // Main Render & Physics Simulation Loop
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let lastTime = performance.now();
+
+    const renderLoop = (time: number) => {
+      // dt for animation
+      lastTime = time;
+
+      const dpr = window.devicePixelRatio || 1;
+      const width = canvas.width / dpr;
+      const height = canvas.height / dpr;
+      const center = arenaCenterRef.current;
+      const radius = arenaRadiusRef.current;
+      const currentConfig = configRef.current;
+
+      ctx.save();
+      ctx.scale(dpr, dpr);
+
+      // 1. Draw Arena Background
+      ctx.fillStyle = '#05070f';
+      ctx.fillRect(0, 0, width, height);
+
+      // Deep radial glow in arena center
+      const bgGlow = ctx.createRadialGradient(center.x, center.y, 10, center.x, center.y, radius * 1.2);
+      bgGlow.addColorStop(0, 'rgba(15, 23, 42, 0.9)');
+      bgGlow.addColorStop(0.7, 'rgba(5, 7, 15, 0.95)');
+      bgGlow.addColorStop(1, 'rgba(2, 4, 10, 1)');
+      ctx.fillStyle = bgGlow;
+      ctx.fillRect(0, 0, width, height);
+
+      // Inner arena circular fill with subtle radial highlight
+      ctx.beginPath();
+      ctx.arc(center.x, center.y, radius, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(10, 15, 29, 0.7)';
+      ctx.fill();
+
+      // Outer Arena Boundary: Glowing Neon Circular Perimeter Ring
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(center.x, center.y, radius, 0, Math.PI * 2);
+      ctx.lineWidth = 3.5;
+      ctx.strokeStyle = '#ffffff';
+      ctx.shadowColor = 'rgba(255, 255, 255, 0.7)';
+      ctx.shadowBlur = 12 * currentConfig.glowIntensity;
+      ctx.stroke();
+
+      // Second soft outer halo ring
+      ctx.beginPath();
+      ctx.arc(center.x, center.y, radius, 0, Math.PI * 2);
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = 'rgba(147, 197, 253, 0.5)';
+      ctx.shadowBlur = 24 * currentConfig.glowIntensity;
+      ctx.stroke();
+      ctx.restore();
+
+      // 2. Physics Execution (if active and not paused)
+      if (isRunningRef.current && !isRoundOverRef.current) {
+        const stepResult = stepSimulation(
+          ballsRef.current,
+          center,
+          radius,
+          currentConfig.speedMultiplier,
+          4 // 4 substeps for precision collision checking
+        );
+
+        // Process Rim Bounces
+        if (stepResult.bounces.length > 0) {
+          for (const bounce of stepResult.bounces) {
+            soundEngine.playBounce();
+            const sparks = createBounceSparks(
+              bounce.x,
+              bounce.y,
+              bounce.normalX,
+              bounce.normalY,
+              bounce.ball.color
+            );
+            particlesRef.current.push(...sparks);
+          }
+        }
+
+        // Process Line Cuts
+        if (stepResult.lineDestructions && stepResult.lineDestructions.length > 0) {
+          for (const dest of stepResult.lineDestructions) {
+            soundEngine.playLineCut();
+            const sparks = createBounceSparks(
+              dest.x, dest.y,
+              Math.random() - 0.5, Math.random() - 0.5,
+              dest.owner.color
+            );
+            particlesRef.current.push(...sparks);
+          }
+        }
+
+        // Process Eliminations
+        if (stepResult.eliminated.length > 0) {
+          for (const elim of stepResult.eliminated) {
+            soundEngine.playElimination();
+
+            const { particles, shockwave } = createEliminationParticles(
+              elim.victim.x,
+              elim.victim.y,
+              elim.victim.color,
+              elim.victim.secondaryColor
+            );
+            particlesRef.current.push(...particles);
+            shockwavesRef.current.push(shockwave);
+
+            // Record kill event
+            const elapsed = Math.max(0, (Date.now() - roundStartTimeRef.current) / 1000);
+            const newEvent: KillEvent = {
+              id: `kill-${Date.now()}-${Math.random()}`,
+              victimName: elim.victim.name,
+              victimColor: elim.victim.color,
+              killerName: elim.killer.name,
+              killerColor: elim.killer.color,
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+              timeSurvived: parseFloat(elapsed.toFixed(1)),
+            };
+
+            setKillFeed((prev) => [newEvent, ...prev.slice(0, 7)]);
+          }
+
+          // Update active balls in React state
+          const remaining = ballsRef.current.filter((b) => b.alive);
+          setActiveBalls([...ballsRef.current]);
+
+          // Check Win Condition: Only 1 ball alive
+          if (remaining.length <= 1) {
+            isRoundOverRef.current = true;
+            setIsRoundOver(true);
+            const winningBall = remaining.length === 1 ? remaining[0] : null;
+            setWinner(winningBall);
+
+            if (winningBall) {
+              soundEngine.playVictory();
+              triggerCelebration(winningBall.color);
+
+              // Update Stats
+              setStats((prev) =>
+                prev.map((s) =>
+                  s.color === winningBall.color ? { ...s, wins: s.wins + 1 } : s
+                )
+              );
+
+              // Prediction evaluation
+              if (selectedBallPredictionRef.current) {
+                const isCorrect = selectedBallPredictionRef.current === winningBall.color;
+                setPredictionStreak((curr) => (isCorrect ? curr + 1 : 0));
+                setPredictionAccuracy((curr) => ({
+                  wins: curr.wins + (isCorrect ? 1 : 0),
+                  total: curr.total + 1,
+                }));
+              }
+            }
+
+            // Trigger Auto-Restart countdown if enabled
+            if (currentConfig.autoRestart) {
+              let countdown = currentConfig.autoRestartDelaySec;
+              setRestartCountdown(countdown);
+              restartCountdownRef.current = countdown;
+
+              autoRestartTimerRef.current = setInterval(() => {
+                restartCountdownRef.current -= 1;
+                setRestartCountdown(restartCountdownRef.current);
+                if (restartCountdownRef.current <= 0) {
+                  if (autoRestartTimerRef.current) {
+                    clearInterval(autoRestartTimerRef.current);
+                    autoRestartTimerRef.current = null;
+                  }
+                  setRoundNumber((r) => r + 1);
+                  startNewRound();
+                }
+              }, 1000);
+            }
+          }
+        }
+      }
+
+      // 3. Render Laser Fans (Strings) for all alive balls
+      for (const ball of ballsRef.current) {
+        if (!ball.alive) continue;
+
+        const anchors = computeRayAnchors(
+          center.x,
+          center.y,
+          radius,
+          ball.arcCenterAngle,
+          ball.arcSpan,
+          ball.rayCount
+        );
+
+        // Draw Perimeter Anchor Dots on circular rim
+        for (let i = 0; i < anchors.length; i++) {
+          if (!ball.activeLines[i]) continue;
+          const anchor = anchors[i];
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(anchor.x, anchor.y, 2.5, 0, Math.PI * 2);
+          ctx.fillStyle = ball.color;
+          ctx.shadowColor = ball.glowColor;
+          ctx.shadowBlur = 8 * currentConfig.glowIntensity;
+          ctx.fill();
+          ctx.restore();
+        }
+
+        // Draw Laser Rays from Ball Center to Each Anchor
+        ctx.save();
+        for (let i = 0; i < anchors.length; i++) {
+          if (!ball.activeLines[i]) continue;
+          const anchor = anchors[i];
+          // Glow Outer Pass
+          ctx.beginPath();
+          ctx.moveTo(ball.x, ball.y);
+          ctx.lineTo(anchor.x, anchor.y);
+          ctx.lineWidth = 2.2;
+          ctx.strokeStyle = ball.color;
+          ctx.shadowColor = ball.glowColor;
+          ctx.shadowBlur = 10 * currentConfig.glowIntensity;
+          ctx.globalAlpha = 0.85;
+          ctx.stroke();
+
+          // Bright Core Inner Pass
+          ctx.beginPath();
+          ctx.moveTo(ball.x, ball.y);
+          ctx.lineTo(anchor.x, anchor.y);
+          ctx.lineWidth = 0.9;
+          ctx.strokeStyle = '#ffffff';
+          ctx.globalAlpha = 0.75;
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+
+      // 4. Render Active Balls
+      for (const ball of ballsRef.current) {
+        if (!ball.alive) continue;
+
+        ctx.save();
+
+        // Outer Glow Aura
+        const auraGradient = ctx.createRadialGradient(
+          ball.x,
+          ball.y,
+          ball.radius * 0.4,
+          ball.x,
+          ball.y,
+          ball.radius * 2.2
+        );
+        auraGradient.addColorStop(0, ball.glowColor);
+        auraGradient.addColorStop(0.5, ball.color);
+        auraGradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, ball.radius * 2.2, 0, Math.PI * 2);
+        ctx.fillStyle = auraGradient;
+        ctx.globalAlpha = 0.4 * currentConfig.glowIntensity;
+        ctx.fill();
+
+        // Main Ball Body
+        ctx.globalAlpha = 1.0;
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
+        ctx.fillStyle = ball.color;
+        ctx.shadowColor = ball.glowColor;
+        ctx.shadowBlur = 14 * currentConfig.glowIntensity;
+        ctx.fill();
+
+        // Crisp White Border Ring
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = '#ffffff';
+        ctx.stroke();
+
+        // Specular 3D highlight dot
+        ctx.beginPath();
+        ctx.arc(
+          ball.x - ball.radius * 0.32,
+          ball.y - ball.radius * 0.32,
+          ball.radius * 0.28,
+          0,
+          Math.PI * 2
+        );
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+        ctx.shadowBlur = 0;
+        ctx.fill();
+
+        // Prediction Crown Indicator if user bet on this ball
+        if (selectedBallPredictionRef.current === ball.color) {
+          ctx.font = '12px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillStyle = '#FFD700';
+          ctx.fillText('⭐', ball.x, ball.y - ball.radius - 8);
+        }
+
+        ctx.restore();
+      }
+
+      // 5. Render Shockwaves
+      for (let i = shockwavesRef.current.length - 1; i >= 0; i--) {
+        const sw = shockwavesRef.current[i];
+        sw.radius += 2.5;
+        sw.alpha *= 0.92;
+
+        if (sw.alpha <= 0.02 || sw.radius >= sw.maxRadius) {
+          shockwavesRef.current.splice(i, 1);
+          continue;
+        }
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(sw.x, sw.y, sw.radius, 0, Math.PI * 2);
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = sw.color;
+        ctx.globalAlpha = sw.alpha;
+        ctx.shadowColor = sw.color;
+        ctx.shadowBlur = 16;
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // 6. Render Particles (Explosions & Sparks)
+      for (let i = particlesRef.current.length - 1; i >= 0; i--) {
+        const p = particlesRef.current[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vx *= 0.96;
+        p.vy *= 0.96;
+        p.life += 1;
+        p.alpha = Math.max(0, 1 - p.life / p.maxLife);
+
+        if (p.life >= p.maxLife || p.alpha <= 0.01) {
+          particlesRef.current.splice(i, 1);
+          continue;
+        }
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, Math.max(0.5, p.size * (1 - p.life / p.maxLife)), 0, Math.PI * 2);
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = p.alpha;
+        ctx.shadowColor = p.color;
+        ctx.shadowBlur = 8;
+        ctx.fill();
+        ctx.restore();
+      }
+
+      ctx.restore();
+      animationFrameRef.current = requestAnimationFrame(renderLoop);
+    };
+
+    animationFrameRef.current = requestAnimationFrame(renderLoop);
+
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, [triggerCelebration, startNewRound]);
+
+  // Toggle Play / Pause
+  const togglePlayPause = () => {
+    const nextState = !isPlaying;
+    setIsPlaying(nextState);
+    isRunningRef.current = nextState;
+    soundEngine.playClick();
+  };
+
+  // Single Frame Step (useful for slow motion inspect)
+  const stepOneFrame = () => {
+    if (isRoundOverRef.current) return;
+    const center = arenaCenterRef.current;
+    const radius = arenaRadiusRef.current;
+    stepSimulation(ballsRef.current, center, radius, 1.0, 4);
+    setActiveBalls([...ballsRef.current]);
+    soundEngine.playClick();
+  };
+
+  // Toggle Fullscreen
+  const toggleFullscreen = () => {
+    if (!containerRef.current) return;
+    if (!document.fullscreenElement) {
+      containerRef.current.requestFullscreen().catch(() => {});
+      setIsFullscreen(true);
+    } else {
+      document.exitFullscreen().catch(() => {});
+      setIsFullscreen(false);
+    }
+  };
+
+  // Update ball config parameters without re-creating all balls if not desired
+  const updateRayCount = (count: number) => {
+    setConfig((prev) => ({ ...prev, rayCount: count }));
+    ballsRef.current.forEach((b) => {
+      b.rayCount = count;
+      b.activeLines = new Array(count).fill(true);
+    });
+  };
+
+  const updateArcSpan = (deg: number) => {
+    setConfig((prev) => ({ ...prev, arcSpanDeg: deg }));
+    const rad = (deg * Math.PI) / 180;
+    ballsRef.current.forEach((b) => {
+      b.arcSpan = rad;
+    });
+  };
+
+  const updateSpeed = (spd: number) => {
+    setConfig((prev) => ({ ...prev, baseSpeed: spd }));
+    ballsRef.current.forEach((b) => {
+      b.speed = spd;
+    });
+  };
+
+  const updateRadius = (r: number) => {
+    setConfig((prev) => ({ ...prev, ballRadius: r }));
+    ballsRef.current.forEach((b) => {
+      b.radius = r;
+    });
+  };
+
+  // Count of alive balls
+  const aliveCount = activeBalls.filter((b) => b.alive).length;
+
+  return (
+    <div
+      id="laser-battle-royale-root"
+      ref={containerRef}
+      className="relative flex flex-col items-center justify-center min-h-screen bg-slate-950 text-slate-100 p-2 sm:p-4 select-none overflow-x-hidden font-sans"
+    >
+      {/* Top Header & Round HUD */}
+      <header
+        id="battle-header"
+        className="w-full max-w-5xl flex flex-wrap items-center justify-between gap-3 px-3 py-2.5 mb-2 bg-slate-900/80 backdrop-blur-md rounded-xl border border-slate-800 shadow-xl"
+      >
+        <div className="flex items-center gap-3">
+          <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-pink-500/20 border border-pink-500/40 text-pink-400 shadow-[0_0_15px_rgba(236,72,153,0.3)]">
+            <Zap className="w-5 h-5" />
+          </div>
+          <div>
+            <h1 className="text-base sm:text-lg font-bold tracking-wide text-white flex items-center gap-2">
+              Laser String Battle Royale
+              <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+                Round {roundNumber}
+              </span>
+            </h1>
+            <p className="text-xs text-slate-400 hidden sm:block">
+              2D Physics Dynamic Multi-Line Fan Elimination Simulation
+            </p>
+          </div>
+        </div>
+
+        {/* Live Status Badges & Quick Stats */}
+        <div className="flex items-center gap-2 sm:gap-4">
+          <div
+            id="alive-count-badge"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800/90 border border-slate-700 text-xs font-medium"
+          >
+            <Swords className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+            <span className="text-slate-400">Alive:</span>
+            <span className="font-bold text-emerald-300">{aliveCount} / {config.ballCount}</span>
+          </div>
+
+          {predictionStreak > 0 && (
+            <div
+              id="streak-badge"
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-amber-500/20 border border-amber-500/40 text-amber-300 text-xs font-bold shadow-[0_0_12px_rgba(245,158,11,0.25)]"
+            >
+              <Flame className="w-3.5 h-3.5 text-amber-400 fill-amber-400 animate-bounce" />
+              <span>{predictionStreak} Streak!</span>
+            </div>
+          )}
+
+          {/* Audio toggle */}
+          <button
+            id="sound-toggle-btn"
+            onClick={() => {
+              const next = !soundEnabled;
+              setSoundEnabled(next);
+              setConfig((prev) => ({ ...prev, soundEnabled: next }));
+              soundEngine.setEnabled(next);
+            }}
+            className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition-colors border border-slate-700"
+            title={soundEnabled ? 'Mute Sound' : 'Unmute Sound'}
+            aria-label="Toggle Sound"
+          >
+            {soundEnabled ? <Volume2 className="w-4 h-4 text-cyan-400" /> : <VolumeX className="w-4 h-4 text-slate-500" />}
+          </button>
+
+          {/* Settings Drawer Toggle */}
+          <button
+            id="settings-toggle-btn"
+            onClick={() => {
+              setShowSettings(!showSettings);
+              soundEngine.playClick();
+            }}
+            className={`p-2 rounded-lg border transition-colors ${
+              showSettings
+                ? 'bg-pink-600 text-white border-pink-500'
+                : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
+            }`}
+            title="Simulation Settings"
+            aria-label="Simulation Settings"
+          >
+            <Settings2 className="w-4 h-4" />
+          </button>
+
+          {/* Fullscreen toggle */}
+          <button
+            id="fullscreen-toggle-btn"
+            onClick={toggleFullscreen}
+            className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 hidden md:block"
+            title="Toggle Fullscreen"
+            aria-label="Toggle Fullscreen"
+          >
+            {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+          </button>
+        </div>
+      </header>
+
+      {/* "Who Will Win?" Prediction Bar (TikTok trend interactive betting) */}
+      <div
+        id="prediction-bar"
+        className="w-full max-w-5xl px-3 py-2 mb-2 bg-slate-900/60 backdrop-blur-md rounded-xl border border-slate-800/80 flex flex-wrap items-center justify-between gap-2"
+      >
+        <div className="flex items-center gap-2">
+          <Sparkles className="w-4 h-4 text-amber-400" />
+          <span className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+            Predict The Winner:
+          </span>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+          {activeBalls.map((ball) => {
+            const isSelected = predictedColor === ball.color;
+            const isAlive = ball.alive;
+            return (
+              <button
+                key={ball.id}
+                id={`predict-btn-${ball.name.toLowerCase().replace(/\s+/g, '-')}`}
+                onClick={() => {
+                  setPredictedColor(ball.color);
+                  soundEngine.playClick();
+                }}
+                disabled={isRoundOver}
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium transition-all ${
+                  isSelected
+                    ? 'ring-2 ring-white ring-offset-2 ring-offset-slate-950 scale-105 font-bold shadow-lg'
+                    : 'opacity-85 hover:opacity-100 hover:scale-102'
+                } ${!isAlive ? 'opacity-30 line-through' : ''}`}
+                style={{
+                  backgroundColor: `${ball.color}25`,
+                  borderColor: ball.color,
+                  borderWidth: '1px',
+                  color: '#ffffff',
+                }}
+              >
+                <span
+                  className="w-2.5 h-2.5 rounded-full inline-block shadow-sm"
+                  style={{ backgroundColor: ball.color, boxShadow: `0 0 8px ${ball.color}` }}
+                />
+                <span>{ball.name}</span>
+                {isSelected && <span className="text-[10px] text-amber-300">★</span>}
+              </button>
+            );
+          })}
+          {predictedColor && (
+            <button
+              onClick={() => setPredictedColor(null)}
+              className="text-[11px] text-slate-400 hover:text-slate-200 underline ml-1"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Main Simulation Viewport Grid */}
+      <div className="w-full max-w-5xl grid grid-cols-1 lg:grid-cols-12 gap-3 items-start">
+        {/* Arena Canvas (Center stage) */}
+        <div
+          id="canvas-wrapper"
+          className="lg:col-span-8 relative flex items-center justify-center bg-slate-950 rounded-2xl border border-slate-800 shadow-2xl p-2 sm:p-4 overflow-hidden min-h-[380px] sm:min-h-[500px]"
+        >
+          <canvas
+            id="simulation-canvas"
+            ref={canvasRef}
+            className="block touch-none max-w-full max-h-[72vh] aspect-square rounded-xl"
+          />
+
+          {/* Victory Overlay Announcement */}
+          {winner && (
+            <div
+              id="winner-banner-overlay"
+              className="absolute inset-0 bg-slate-950/75 backdrop-blur-sm flex flex-col items-center justify-center p-6 text-center animate-in fade-in zoom-in duration-300 rounded-2xl"
+            >
+              <div
+                className="w-16 h-16 rounded-full flex items-center justify-center mb-3 shadow-[0_0_30px_rgba(255,255,255,0.4)]"
+                style={{
+                  backgroundColor: winner.color,
+                  boxShadow: `0 0 35px ${winner.glowColor}`,
+                }}
+              >
+                <Trophy className="w-9 h-9 text-slate-950 fill-white" />
+              </div>
+
+              <span className="text-xs uppercase font-extrabold tracking-widest text-slate-300 mb-1">
+                VICTORY ROYALE
+              </span>
+              <h2
+                className="text-2xl sm:text-3xl font-black mb-2 drop-shadow-md"
+                style={{ color: winner.glowColor }}
+              >
+                {winner.name.toUpperCase()} WINS!
+              </h2>
+
+              {/* Prediction Result */}
+              {predictedColor && (
+                <div
+                  className={`text-xs font-semibold px-3 py-1 rounded-full mb-4 border ${
+                    predictedColor === winner.color
+                      ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 shadow-[0_0_15px_rgba(16,185,129,0.3)]'
+                      : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                  }`}
+                >
+                  {predictedColor === winner.color
+                    ? '🎉 You predicted correctly!'
+                    : `Your prediction was ${
+                        BALL_PRESETS.find((p) => p.color === predictedColor)?.name || 'another ball'
+                      }. Next time!`}
+                </div>
+              )}
+
+              {/* Countdown or Next Battle CTA */}
+              <div className="flex items-center gap-3">
+                <button
+                  id="play-again-btn"
+                  onClick={() => {
+                    setRoundNumber((r) => r + 1);
+                    startNewRound();
+                  }}
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-bold text-sm bg-gradient-to-r from-pink-500 to-cyan-500 hover:from-pink-400 hover:to-cyan-400 text-slate-950 shadow-lg hover:shadow-cyan-500/25 transition-all transform hover:scale-105"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                  Next Battle {restartCountdown > 0 ? `(${restartCountdown}s)` : ''}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Quick Playback Bar floating at bottom of canvas */}
+          <div
+            id="playback-control-pill"
+            className="absolute bottom-3 left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-900/90 backdrop-blur-md border border-slate-700/80 shadow-2xl z-10"
+          >
+            <button
+              id="pause-play-btn"
+              onClick={togglePlayPause}
+              className="p-1.5 rounded-full bg-slate-800 hover:bg-slate-700 text-white transition-colors"
+              title={isPlaying ? 'Pause' : 'Play'}
+              aria-label={isPlaying ? 'Pause simulation' : 'Play simulation'}
+            >
+              {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 fill-current text-emerald-400" />}
+            </button>
+
+            <button
+              id="step-frame-btn"
+              onClick={stepOneFrame}
+              disabled={isPlaying || isRoundOver}
+              className="p-1.5 rounded-full bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-300 hover:text-white transition-colors"
+              title="Step Single Frame"
+              aria-label="Step Single Frame"
+            >
+              <StepForward className="w-3.5 h-3.5" />
+            </button>
+
+            <button
+              id="restart-round-btn"
+              onClick={() => {
+                setRoundNumber((r) => r + 1);
+                startNewRound();
+              }}
+              className="p-1.5 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition-colors"
+              title="Restart Battle"
+              aria-label="Restart Battle"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+            </button>
+
+            <div className="h-4 w-px bg-slate-700 mx-1" />
+
+            {/* Speed Multiplier Quick Buttons */}
+            {[0.5, 1.0, 1.5, 2.0].map((spd) => (
+              <button
+                key={spd}
+                id={`speed-btn-${spd}x`}
+                onClick={() => {
+                  setConfig((prev) => ({ ...prev, speedMultiplier: spd }));
+                  soundEngine.playClick();
+                }}
+                className={`px-2 py-0.5 text-xs font-semibold rounded-full transition-colors ${
+                  config.speedMultiplier === spd
+                    ? 'bg-cyan-500 text-slate-950 font-bold'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {spd}x
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Side Panel: Combat Feed & Leaderboard */}
+        <div className="lg:col-span-4 flex flex-col gap-3">
+          {/* Active Balls Status Panel */}
+          <div
+            id="active-balls-panel"
+            className="p-3.5 bg-slate-900/80 backdrop-blur-md rounded-xl border border-slate-800 shadow-lg"
+          >
+            <div className="flex items-center justify-between mb-2.5 pb-2 border-b border-slate-800">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                <Swords className="w-3.5 h-3.5 text-pink-400" />
+                Combatants
+              </span>
+              <span className="text-[11px] text-slate-400 font-mono">
+                {aliveCount} Standing
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 gap-1.5">
+              {activeBalls.map((ball) => (
+                <div
+                  key={ball.id}
+                  id={`combatant-row-${ball.name.toLowerCase().replace(/\s+/g, '-')}`}
+                  className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg border transition-all ${
+                    ball.alive
+                      ? 'bg-slate-800/60 border-slate-700/60'
+                      : 'bg-slate-950/40 border-slate-900 opacity-40'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <div
+                      className="w-3.5 h-3.5 rounded-full border border-white/50"
+                      style={{
+                        backgroundColor: ball.color,
+                        boxShadow: ball.alive ? `0 0 10px ${ball.color}` : 'none',
+                      }}
+                    />
+                    <span className={`text-xs font-semibold ${ball.alive ? 'text-slate-200' : 'line-through text-slate-500'}`}>
+                      {ball.name}
+                    </span>
+                    {predictedColor === ball.color && (
+                      <span className="text-[10px] bg-amber-500/20 text-amber-300 px-1.5 py-0.2 rounded border border-amber-500/30">
+                        Pick
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-2 text-xs">
+                    {ball.kills > 0 && (
+                      <span className="text-[11px] font-bold text-rose-400 flex items-center gap-0.5">
+                        <Zap className="w-3 h-3" />
+                        {ball.kills} {ball.kills === 1 ? 'Kill' : 'Kills'}
+                      </span>
+                    )}
+                    <span
+                      className={`text-[11px] font-bold px-1.5 py-0.5 rounded ${
+                        ball.alive
+                          ? 'text-emerald-400 bg-emerald-500/10'
+                          : 'text-rose-400 bg-rose-500/10'
+                      }`}
+                    >
+                      {ball.alive ? 'ALIVE' : 'ELIMINATED'}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Real-time Elimination Combat Feed */}
+          <div
+            id="combat-feed-panel"
+            className="p-3.5 bg-slate-900/80 backdrop-blur-md rounded-xl border border-slate-800 shadow-lg min-h-[160px]"
+          >
+            <div className="flex items-center justify-between mb-2 pb-2 border-b border-slate-800">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                <Flame className="w-3.5 h-3.5 text-rose-400" />
+                Elimination Log
+              </span>
+              <span className="text-[11px] text-slate-400 font-mono">Live</span>
+            </div>
+
+            <div className="space-y-1.5 max-h-[140px] overflow-y-auto pr-1">
+              {killFeed.length === 0 ? (
+                <div className="py-6 text-center text-xs text-slate-500 italic">
+                  Battle in progress... No eliminations yet.
+                </div>
+              ) : (
+                killFeed.map((event) => (
+                  <div
+                    key={event.id}
+                    className="flex items-center justify-between p-1.5 rounded bg-slate-800/40 border border-slate-700/40 text-xs animate-in fade-in slide-in-from-right-2 duration-200"
+                  >
+                    <div className="flex items-center gap-1.5 truncate">
+                      <span className="font-bold" style={{ color: event.killerColor }}>
+                        {event.killerName}
+                      </span>
+                      <span className="text-slate-400 text-[10px]">laser sliced</span>
+                      <span className="font-bold line-through text-slate-400" style={{ color: event.victimColor }}>
+                        {event.victimName}
+                      </span>
+                    </div>
+                    <span className="text-[10px] text-slate-500 ml-1 shrink-0 font-mono">
+                      {event.timeSurvived}s
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          {/* Victory Leaderboard (Wins Tally) */}
+          <div
+            id="leaderboard-panel"
+            className="p-3.5 bg-slate-900/80 backdrop-blur-md rounded-xl border border-slate-800 shadow-lg"
+          >
+            <div className="flex items-center justify-between mb-2 pb-2 border-b border-slate-800">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                <Trophy className="w-3.5 h-3.5 text-amber-400" />
+                Hall of Champions
+              </span>
+              <span className="text-[11px] text-slate-400 font-mono">
+                {predictionAccuracy.total > 0
+                  ? `Predictions: ${predictionAccuracy.wins}/${predictionAccuracy.total}`
+                  : 'Total Wins'}
+              </span>
+            </div>
+
+            <div className="space-y-1">
+              {[...stats]
+                .sort((a, b) => b.wins - a.wins)
+                .slice(0, 5)
+                .map((item, idx) => (
+                  <div
+                    key={item.color}
+                    className="flex items-center justify-between px-2 py-1 rounded bg-slate-800/30 text-xs"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-slate-500 font-mono text-[10px] w-3">#{idx + 1}</span>
+                      <span
+                        className="w-2.5 h-2.5 rounded-full"
+                        style={{ backgroundColor: item.color }}
+                      />
+                      <span className="font-medium text-slate-300">{item.name}</span>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <span className="font-bold text-amber-300">{item.wins}</span>
+                      <span className="text-[10px] text-slate-500">wins</span>
+                    </div>
+                  </div>
+                ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Settings Modal / Drawer */}
+      {showSettings && (
+        <div
+          id="settings-overlay-modal"
+          className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4"
+        >
+          <div className="w-full max-w-md bg-slate-900 border border-slate-700 rounded-2xl p-5 shadow-2xl animate-in zoom-in-95 duration-200">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
+              <h3 className="text-base font-bold text-white flex items-center gap-2">
+                <Settings2 className="w-4 h-4 text-cyan-400" />
+                Simulation Physics & Visuals
+              </h3>
+              <button
+                onClick={() => setShowSettings(false)}
+                className="text-slate-400 hover:text-white text-sm p-1"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-4 text-xs">
+              {/* Ball Count */}
+              <div>
+                <div className="flex justify-between mb-1">
+                  <label className="text-slate-300 font-medium">Ball Count (Combatants)</label>
+                  <span className="font-mono text-cyan-400 font-bold">{config.ballCount} Balls</span>
+                </div>
+                <input
+                  type="range"
+                  min="2"
+                  max="8"
+                  value={config.ballCount}
+                  onChange={(e) => {
+                    const count = parseInt(e.target.value, 10);
+                    setConfig((prev) => ({ ...prev, ballCount: count }));
+                    startNewRound(count);
+                  }}
+                  className="w-full accent-cyan-400 cursor-pointer"
+                />
+              </div>
+
+              {/* Rays Per Fan */}
+              <div>
+                <div className="flex justify-between mb-1">
+                  <label className="text-slate-300 font-medium">Laser Strings per Fan</label>
+                  <span className="font-mono text-pink-400 font-bold">{config.rayCount} Strings</span>
+                </div>
+                <input
+                  type="range"
+                  min="5"
+                  max="60"
+                  value={config.rayCount}
+                  onChange={(e) => {
+                    updateRayCount(parseInt(e.target.value, 10));
+                  }}
+                  className="w-full accent-pink-400 cursor-pointer"
+                />
+              </div>
+
+              {/* Fan Arc Spread */}
+              <div>
+                <div className="flex justify-between mb-1">
+                  <label className="text-slate-300 font-medium">Fan Arc Spread on Rim</label>
+                  <span className="font-mono text-emerald-400 font-bold">{config.arcSpanDeg}°</span>
+                </div>
+                <input
+                  type="range"
+                  min="15"
+                  max="120"
+                  value={config.arcSpanDeg}
+                  onChange={(e) => {
+                    updateArcSpan(parseInt(e.target.value, 10));
+                  }}
+                  className="w-full accent-emerald-400 cursor-pointer"
+                />
+              </div>
+
+              {/* Base Ball Speed */}
+              <div>
+                <div className="flex justify-between mb-1">
+                  <label className="text-slate-300 font-medium">Ball Speed</label>
+                  <span className="font-mono text-amber-400 font-bold">{config.baseSpeed.toFixed(1)} px/f</span>
+                </div>
+                <input
+                  type="range"
+                  min="2.0"
+                  max="9.0"
+                  step="0.2"
+                  value={config.baseSpeed}
+                  onChange={(e) => {
+                    updateSpeed(parseFloat(e.target.value));
+                  }}
+                  className="w-full accent-amber-400 cursor-pointer"
+                />
+              </div>
+
+              {/* Ball Radius */}
+              <div>
+                <div className="flex justify-between mb-1">
+                  <label className="text-slate-300 font-medium">Ball Hitbox Radius</label>
+                  <span className="font-mono text-purple-400 font-bold">{config.ballRadius} px</span>
+                </div>
+                <input
+                  type="range"
+                  min="8"
+                  max="22"
+                  value={config.ballRadius}
+                  onChange={(e) => {
+                    updateRadius(parseInt(e.target.value, 10));
+                  }}
+                  className="w-full accent-purple-400 cursor-pointer"
+                />
+              </div>
+
+              {/* Auto Restart Toggle */}
+              <div className="flex items-center justify-between pt-2 border-t border-slate-800">
+                <label className="text-slate-300 font-medium">Continuous Auto-Battle Loop</label>
+                <button
+                  onClick={() => {
+                    setConfig((prev) => ({ ...prev, autoRestart: !prev.autoRestart }));
+                    soundEngine.playClick();
+                  }}
+                  className={`w-11 h-6 flex items-center rounded-full p-1 transition-colors ${
+                    config.autoRestart ? 'bg-cyan-500' : 'bg-slate-700'
+                  }`}
+                >
+                  <div
+                    className={`bg-white w-4 h-4 rounded-full shadow-md transform transition-transform ${
+                      config.autoRestart ? 'translate-x-5' : 'translate-x-0'
+                    }`}
+                  />
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                onClick={() => {
+                  setConfig(DEFAULT_CONFIG);
+                  startNewRound(DEFAULT_CONFIG.ballCount);
+                  setShowSettings(false);
+                }}
+                className="px-3 py-1.5 text-xs text-slate-400 hover:text-slate-200 border border-slate-700 rounded-lg"
+              >
+                Reset Defaults
+              </button>
+              <button
+                onClick={() => setShowSettings(false)}
+                className="px-4 py-1.5 text-xs font-bold bg-cyan-500 hover:bg-cyan-400 text-slate-950 rounded-lg"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

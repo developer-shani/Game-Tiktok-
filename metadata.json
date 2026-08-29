@@ -1,0 +1,6 @@
+{
+  "name": "Laser Elimination Battle Royale",
+  "description": "2D Physics simulation of dynamic laser string elimination battle royale with bouncing balls and neon visual effects.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
