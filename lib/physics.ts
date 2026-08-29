@@ -90,12 +90,13 @@ export function initializeBalls(
     const arcCenterAngle = angleAroundCenter;
 
     const anchors: RayAnchor[] = [];
-    for (let j = 0; j < config.rayCount; j++) {
+    const initialOffsets = [0, -0.05, 0.05];
+    for (let j = 0; j < 3; j++) {
+      const angle = arcCenterAngle + initialOffsets[j];
       anchors.push({
-        x: arenaCenter.x + Math.cos(arcCenterAngle) * arenaRadius,
-        y: arenaCenter.y + Math.sin(arcCenterAngle) * arenaRadius,
+        x: arenaCenter.x + Math.cos(angle) * arenaRadius,
+        y: arenaCenter.y + Math.sin(angle) * arenaRadius,
         active: true,
-        moved: false,
         id: j
       });
     }
@@ -186,17 +187,19 @@ export function stepSimulation(
             }
           }
 
-          // Move up to 3 active, un-moved anchors to the new bounce point
-          let anchoredCount = 0;
-          for (let i = 0; i < ball.anchors.length && anchoredCount < 3; i++) {
-            const anchor = ball.anchors[i];
-            if (anchor.active && !anchor.moved) {
-              // Place the anchor exactly on the boundary wall
-              anchor.x = arenaCenter.x + nx * arenaRadius;
-              anchor.y = arenaCenter.y + ny * arenaRadius;
-              anchor.moved = true;
-              anchoredCount++;
-            }
+          // Add 3 brand new lines/anchors attached to the new bounce point on the wall
+          // Previous lines are NEVER removed or replaced; they stay active at their existing wall points.
+          const baseAngle = Math.atan2(ny, nx);
+          const angleOffsets = [0, -0.05, 0.05]; // Spread angles: center, slightly left, slightly right
+          
+          for (let k = 0; k < 3; k++) {
+            const angle = baseAngle + angleOffsets[k];
+            ball.anchors.push({
+              x: arenaCenter.x + Math.cos(angle) * arenaRadius,
+              y: arenaCenter.y + Math.sin(angle) * arenaRadius,
+              active: true,
+              id: ball.anchors.length,
+            });
           }
 
           result.bounces.push({
@@ -315,7 +318,6 @@ export function stepSimulation(
               x: closestX,
               y: closestY,
             });
-            break; // ONLY CUT ONE LINE PER PHYSICS STEP SO BALLS SURVIVE LONGER
           }
         }
 
