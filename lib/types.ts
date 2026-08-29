@@ -14,6 +14,9 @@ export interface Ball {
   anchors: RayAnchor[];
   nextAnchorIndex: number;
   kills: number;
+  aiPersonality?: 'builder' | 'hunter' | 'balanced';
+  spawnTime?: number;
+  lastCutTime?: Record<string, number>;
   eliminatedAt?: number;  // timestamp or frame
   eliminatedBy?: string;  // killer name
 }
@@ -65,6 +68,7 @@ export interface SimulationConfig {
   gravity: number;
   ballRadius: number;
   competitors: number;
+  initialLines: number;
   players: PlayerConfig[];
 
   // Internal/Laser config preserved

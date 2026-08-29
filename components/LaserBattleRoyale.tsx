@@ -5,7 +5,6 @@ import { Play, Pause, Settings, X } from 'lucide-react';
 import { Ball, Particle, Shockwave, SimulationConfig, PlayerConfig } from '@/lib/types';
 import {
   BALL_PRESETS,
-  
   initializeBalls,
   stepSimulation,
   createEliminationParticles,
@@ -20,6 +19,7 @@ const DEFAULT_CONFIG: SimulationConfig = {
   gravity: 0,
   ballRadius: 15,
   competitors: 4,
+  initialLines: 5,
   players: [
     { name: "Player 1", color: "#FF1493" },
     { name: "Player 2", color: "#00E676" },
@@ -153,38 +153,42 @@ export default function LaserBattleRoyale() {
             currentConfig
           );
 
-          if (currentConfig.soundEnabled) {
-            if (stepResult.bounces.length > 0) {
+          if (stepResult.bounces.length > 0) {
+            if (currentConfig.soundEnabled) {
               soundEngine.playBounce();
-              stepResult.bounces.forEach((b) => {
-                particlesRef.current.push(...createBounceSparks(b.x, b.y, b.normalX, b.normalY, b.ball.color));
-              });
             }
+            stepResult.bounces.forEach((b) => {
+              particlesRef.current.push(...createBounceSparks(b.x, b.y, b.normalX, b.normalY, b.ball.color));
+            });
+          }
 
-            if (stepResult.lineDestructions && stepResult.lineDestructions.length > 0) {
-              for (const dest of stepResult.lineDestructions) {
-                soundEngine.playLineCut();
-                particlesRef.current.push(...createBounceSparks(
-                  dest.x, dest.y,
-                  Math.random() - 0.5, Math.random() - 0.5,
-                  dest.owner.color
-                ));
-              }
+          if (stepResult.lineDestructions && stepResult.lineDestructions.length > 0) {
+            if (currentConfig.soundEnabled) {
+              soundEngine.playLineCut();
             }
+            for (const dest of stepResult.lineDestructions) {
+              particlesRef.current.push(...createBounceSparks(
+                dest.x, dest.y,
+                Math.random() - 0.5, Math.random() - 0.5,
+                dest.owner.color
+              ));
+            }
+          }
 
-            if (stepResult.eliminated.length > 0) {
+          if (stepResult.eliminated.length > 0) {
+            if (currentConfig.soundEnabled) {
               soundEngine.playElimination();
-              stepResult.eliminated.forEach((elim) => {
-                const { particles, shockwave } = createEliminationParticles(
-                  elim.victim.x,
-                  elim.victim.y,
-                  elim.victim.color,
-                  elim.victim.secondaryColor
-                );
-                particlesRef.current.push(...particles);
-                shockwavesRef.current.push(shockwave);
-              });
             }
+            stepResult.eliminated.forEach((elim) => {
+              const { particles, shockwave } = createEliminationParticles(
+                elim.victim.x,
+                elim.victim.y,
+                elim.victim.color,
+                elim.victim.secondaryColor
+              );
+              particlesRef.current.push(...particles);
+              shockwavesRef.current.push(shockwave);
+            });
           }
 
           // Check Win Condition
@@ -371,6 +375,7 @@ export default function LaserBattleRoyale() {
 
               {/* Sliders */}
               {[
+                { label: 'Initial Lines (Power)', key: 'initialLines', min: 1, max: 20, step: 1 },
                 { label: 'Speed', key: 'speed', min: 10, max: 1000, step: 10 },
                 { label: 'Bounciness', key: 'bounciness', min: 0.0, max: 2.0, step: 0.1 },
                 { label: 'Gravity', key: 'gravity', min: 0, max: 2000, step: 50 },

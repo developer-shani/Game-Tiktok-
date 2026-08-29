@@ -79,8 +79,25 @@ export function initializeBalls(
     const x = arenaCenter.x + Math.cos(angleAroundCenter) * spawnDist;
     const y = arenaCenter.y + Math.sin(angleAroundCenter) * spawnDist;
 
-    // Random velocity angle that gives dynamic initial trajectory
-    const velAngle = Math.random() * Math.PI * 2;
+    // Assign strategic AI personalities to balls for varied gameplay:
+    // Builder: Focuses on banking off walls, building massive lines, and staying clear of central dogfights
+    // Hunter: Aggressive interceptor that hunts enemy strings
+    // Balanced: Dynamic mixture of perimeter charging and calculated strikes
+    const personality: 'builder' | 'hunter' | 'balanced' = 
+      i % 3 === 0 ? 'builder' : (i % 3 === 1 ? 'balanced' : 'hunter');
+
+    // Direction calculation:
+    // Builders spawn with outward wall-seeking trajectories so they immediately hit perimeter and power up
+    let velAngle: number;
+    if (personality === 'builder') {
+      // Direct toward outer perimeter
+      velAngle = angleAroundCenter + (Math.random() - 0.5) * 0.5;
+    } else if (personality === 'balanced') {
+      velAngle = angleAroundCenter + (Math.random() > 0.5 ? 1.2 : -1.2);
+    } else {
+      velAngle = Math.random() * Math.PI * 2;
+    }
+
     // Map settings speed (0-1000) to actual pixels per second. 
     // Say max 1000 = 800px/s. So speed/1000 * 800
     const mappedSpeed = Math.max(10, (config.speed / 1000) * 800); 
@@ -89,10 +106,12 @@ export function initializeBalls(
     // Arc anchor position on rim (evenly spaced around perimeter)
     const arcCenterAngle = angleAroundCenter;
 
+    const count = Math.max(1, config.initialLines ?? 5);
     const anchors: RayAnchor[] = [];
-    const initialOffsets = [0, -0.05, 0.05];
-    for (let j = 0; j < 3; j++) {
-      const angle = arcCenterAngle + initialOffsets[j];
+    for (let j = 0; j < count; j++) {
+      // Doubled spacing between initial lines
+      const offset = (j - (count - 1) / 2) * 0.07;
+      const angle = arcCenterAngle + offset;
       anchors.push({
         x: arenaCenter.x + Math.cos(angle) * arenaRadius,
         y: arenaCenter.y + Math.sin(angle) * arenaRadius,
@@ -117,6 +136,8 @@ export function initializeBalls(
       anchors,
       nextAnchorIndex: 0,
       kills: 0,
+      aiPersonality: personality,
+      spawnTime: Date.now(),
     });
   }
 
@@ -151,20 +172,47 @@ export function stepSimulation(
       // Apply Gravity
       ball.vy += config.gravity * dt;
 
-      ball.x += ball.vx * dt;
-      ball.y += ball.vy * dt;
-
       // Distance from arena center
       const dx = ball.x - arenaCenter.x;
       const dy = ball.y - arenaCenter.y;
       const dist = Math.hypot(dx, dy);
 
+      // Smart Tactical Guidance (Strategy Algorithm):
+      // When a ball is a "builder" OR is low on lines (danger zone), it tactically angles toward perimeter boundaries
+      // to farm lines and avoid immediate death, while hunters and high-power balls engage in mid-field cuts.
+      const activeLineCount = ball.anchors.filter((a) => a.active).length;
+      const needsPower = activeLineCount <= 4 || ball.aiPersonality === 'builder';
+      
+      if (needsPower && dist > 5) {
+        // Subtle radial bias nudging ball toward wall to bank lines
+        const radialForce = 45; // Gentle acceleration outward toward perimeter
+        const rx = dx / dist;
+        const ry = dy / dist;
+        ball.vx += rx * radialForce * dt;
+        ball.vy += ry * radialForce * dt;
+
+        // Maintain consistent natural speed
+        const curSpd = Math.hypot(ball.vx, ball.vy);
+        if (curSpd > 0) {
+          ball.vx = (ball.vx / curSpd) * ball.speed;
+          ball.vy = (ball.vy / curSpd) * ball.speed;
+        }
+      }
+
+      ball.x += ball.vx * dt;
+      ball.y += ball.vy * dt;
+
+      // Updated distance after step
+      const nextDx = ball.x - arenaCenter.x;
+      const nextDy = ball.y - arenaCenter.y;
+      const nextDist = Math.hypot(nextDx, nextDy);
+
       const maxAllowedDist = arenaRadius - ball.radius;
 
-      if (dist >= maxAllowedDist) {
+      if (nextDist >= maxAllowedDist) {
         // Normal vector pointing inward from perimeter toward center (or outward)
-        const nx = dx / (dist || 1);
-        const ny = dy / (dist || 1);
+        const nx = nextDx / (nextDist || 1);
+        const ny = nextDy / (nextDist || 1);
 
         // Clamp position back inside perimeter
         ball.x = arenaCenter.x + nx * maxAllowedDist;
@@ -188,9 +236,9 @@ export function stepSimulation(
           }
 
           // Add 3 brand new lines/anchors attached to the new bounce point on the wall
-          // Previous lines are NEVER removed or replaced; they stay active at their existing wall points.
+          // Doubled distance between the 3 lines (2x spread)
           const baseAngle = Math.atan2(ny, nx);
-          const angleOffsets = [0, -0.05, 0.05]; // Spread angles: center, slightly left, slightly right
+          const angleOffsets = [-0.10, 0, 0.10]; // Doubled spread angles (2x wider distance between 3 lines)
           
           for (let k = 0; k < 3; k++) {
             const angle = baseAngle + angleOffsets[k];
@@ -282,6 +330,7 @@ export function stepSimulation(
     const pendingLineDestructions: Array<{ owner: Ball; cutter: Ball; x: number; y: number }> = [];
 
     const activeBalls = balls.filter((b) => b.alive);
+    const lineThicknessTolerance = 3.0;
 
     for (const cutter of activeBalls) {
       for (const owner of activeBalls) {
@@ -304,14 +353,12 @@ export function stepSimulation(
             anchor.y
           );
 
-          // Ball cuts line if distance <= ball radius + line tolerance
-          const lineThicknessTolerance = 2.0;
           if (distance <= cutter.radius + lineThicknessTolerance) {
             anchor.active = false;
             cutAny = true;
             lastHitX = closestX;
             lastHitY = closestY;
-            
+
             pendingLineDestructions.push({
               owner,
               cutter,
@@ -321,7 +368,7 @@ export function stepSimulation(
           }
         }
 
-        // If owner lost all active lines, it is eliminated
+        // If owner lost all active lines, eliminate owner
         if (cutAny && !owner.anchors.some((a) => a.active)) {
           pendingEliminations.set(owner.id, {
             victim: owner,
